@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>长图修图工具 文字导出+撤销双修复版</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#f5f5f5;font-family:system-ui;padding:12px}
+.control-panel{margin-bottom:12px;display:grid;gap:8px}
+.row{display:flex;gap:8px}
+input,button{flex:1;padding:14px;font-size:16px;border:none;border-radius:10px}
+.btn-pick{background:#9c27b0;color:#fff}
+.btn-draw{background:#007aff;color:#fff}
+.btn-text{background:#02b875;color:#fff}
+.btn-undo{background:#ff9500;color:#fff}
+.btn-save{background:#28c76f;color:#fff}
+.color-wrap{display:flex;align-items:center;gap:10px;margin:8px 0}
+.color-view{width:48px;height:48px;border:2px solid #333;border-radius:6px}
+.slider-row{display:flex;align-items:center;gap:10px;margin:4px 0}
+.slider-row label{width:100px;font-size:15px}
+.slider-row input{flex:1}
+.tip-text{font-size:14px;color:#555;margin:6px 0}
+#numInput{padding:14px;font-size:18px;border:1px solid #eee;border-radius:10px}
+
+.img-scroll-wrap {
+  width: 100%;
+  height: 60vh;
+  overflow-x: hidden;
+  overflow-y: auto;
+  border:1px solid #ddd;
+  position: relative;
+}
+#canvas{
+  width:100%;
+  display:block;
+  touch-action:none;
+  image-rendering:crisp-edges;
+  cursor: default;
+}
+#canvas.active-zoom {
+  border: 2px solid #007aff;
+  cursor: grab;
+}
+</style>
+</head>
+<body>
+<div class="control-panel">
+  <input type="file" id="imgInput" accept="image/*">
+
+  <div class="color-wrap">
+    <span>🖊️ 吸管取色预览：</span>
+    <div id="colorView" class="color-view"></div>
+  </div>
+
+  <div class="slider-row">
+    <label>画笔粗细</label>
+    <input type="range" id="brushSlider" min="5" max="50" value="18">
+    <span id="brushVal">18</span>
+  </div>
+  <div class="slider-row">
+    <label>全局文字字号</label>
+    <input type="range" id="fontSlider" min="20" max="150" value="69">
+    <span id="fontVal">69</span>
+  </div>
+  <div class="slider-row">
+    <label>字体粗细</label>
+    <select id="fontWeight" style="padding:12px;border-radius:10px;border:1px solid #eee;width:160px">
+      <option value="normal">常规</option>
+      <option value="bold" selected>加粗</option>
+      <option value="lighter">细体</option>
+    </select>
+  </div>
+
+  <div class="row">
+    <button class="btn-pick" id="pickBtn">吸管取色</button>
+    <button class="btn-draw" id="drawBtn">画笔涂抹</button>
+    <button class="btn-text" id="textBtn">添加文字模式</button>
+  </div>
+  <div class="row">
+    <button class="btn-undo" id="undoBtn">↩️ 撤销上一步</button>
+    <button class="btn-save" id="saveBtn">导出成品图</button>
+  </div>
+
+  <input id="numInput" value="3500" placeholder="输入要添加的文字">
+  <p class="tip-text">文字会写入原图，导出正常显示；撤销同步画笔+文字，取色实时生效</p>
+</div>
+
+<div class="img-scroll-wrap" id="scrollWrap">
+  <canvas id="canvas"></canvas>
+</div>
+
+<script>
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d', { willReadFrequently: true });
+const scrollWrap = document.getElementById('scrollWrap');
+const colorView = document.getElementById('colorView');
+const brushSlider = document.getElementById('brushSlider');
+const brushVal = document.getElementById('brushVal');
+const fontSlider = document.getElementById('fontSlider');
+const fontVal = document.getElementById('fontVal');
+const fontWeightSelect = document.getElementById('fontWeight');
+
+let editedCanvas = null;
+let editCtx = null;
+let workMode = 'idle';
+let selectColor = [255, 255, 255];
+
+// 画笔
+let isDrawing = false;
+let lastDrawX = 0, lastDrawY = 0;
+let brushSize = +brushSlider.value;
+
+// 文字
+let fontSize = +fontSlider.value;
+let fontWeight = fontWeightSelect.value;
+let textList = [];
+let longPressTimer = null;
+const LONG_PRESS_TIME = 300;
+let draggingText = null;
+let dragOffsetX = 0, dragOffsetY = 0;
+let isMouseMoved = false;
+
+// 视图缩放
+let zoomActive = false;
+let viewScale = 1;
+let viewOffsetX = 0;
+let viewOffsetY = 0;
+const minScale = 0.5;
+const maxScale = 3;
+let isViewDrag = false;
+let dragStartClientX = 0, dragStartClientY = 0;
+
+// 【修复撤销】历史同时保存画布图片 + 文字数组快照
+const MAX_HIST = 30;
+let historyStack = [];
+function saveSnapshot(){
+  if (!editedCanvas) return;
+  historyStack.push({
+    img: editedCanvas.toDataURL('image/png'),
+    texts: JSON.parse(JSON.stringify(textList))
+  });
+  if (historyStack.length > MAX_HIST) historyStack.shift();
+}
+
+// 撤销按钮修复
+document.getElementById('undoBtn').onclick = () => {
+  if (historyStack.length === 0) return alert('无操作可撤销');
+  const prev = historyStack.pop();
+  const img = new Image();
+  img.onload = () => {
+    editCtx.clearRect(0, 0, editedCanvas.width, editedCanvas.height);
+    editCtx.drawImage(img, 0, 0);
+    textList = prev.texts;
+    render();
+  }
+  img.src = prev.img;
+}
+
+// 坐标换算
+function getOriginPos(e) {
+  const rect = canvas.getBoundingClientRect();
+  let clientX, clientY;
+  if (e.touches) {
+    clientX = e.touches[0].clientX;
+    clientY = e.touches[0].clientY;
+  } else {
+    clientX = e.clientX;
+    clientY = e.clientY;
+  }
+  const cssScaleX = editedCanvas.width / rect.width;
+  const cssScaleY = editedCanvas.height / rect.height;
+  const screenX = clientX - rect.left;
+  const screenY = clientY - rect.top;
+  const viewX = (screenX - viewOffsetX) / viewScale;
+  const viewY = (screenY - viewOffsetY) / viewScale;
+  return {
+    x: viewX * cssScaleX,
+    y: viewY * cssScaleY
+  }
+}
+
+function findHitText(pos) {
+  if (!editedCanvas) return null;
+  const tempCtx = document.createElement('canvas').getContext('2d');
+  tempCtx.font = `${fontWeight} ${fontSize}px system-ui`;
+  for (let item of textList) {
+    const m = tempCtx.measureText(item.text);
+    const w = m.width;
+    const top = item.y - fontSize;
+    if (pos.x >= item.x && pos.x <= item.x + w && pos.y >= top && pos.y <= item.y) {
+      return item;
+    }
+  }
+  return null;
+}
+
+let renderLock = false;
+function render() {
+  if (renderLock) return;
+  renderLock = true;
+  requestAnimationFrame(() => {
+    if (!editedCanvas) return;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.save();
+    ctx.translate(viewOffsetX, viewOffsetY);
+    ctx.scale(viewScale, viewScale);
+    ctx.drawImage(editedCanvas, 0, 0);
+    const fontCfg = `${fontWeight} ${fontSize}px system-ui`;
+    ctx.font = fontCfg;
+    textList.forEach(item => {
+      ctx.fillStyle = item.color;
+      ctx.fillText(item.text, item.x, item.y);
+    });
+    ctx.restore();
+    renderLock = false;
+  })
+}
+
+// 滑块联动
+brushSlider.oninput = () => {
+  brushSize = +brushSlider.value;
+  brushVal.textContent = brushSize;
+}
+fontSlider.oninput = () => {
+  fontSize = +fontSlider.value;
+  fontVal.textContent = fontSize;
+  render();
+}
+fontWeightSelect.onchange = () => {
+  fontWeight = fontWeightSelect.value;
+  render();
+}
+
+// 模式切换
+document.getElementById('pickBtn').onclick = () => workMode = 'picker';
+document.getElementById('drawBtn').onclick = () => workMode = 'draw';
+document.getElementById('textBtn').onclick = () => workMode = 'text';
+
+// 上传图片初始化
+document.getElementById('imgInput').onchange = e => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = ev => {
+    const img = new Image();
+    img.onload = () => {
+      editedCanvas = document.createElement('canvas');
+      editedCanvas.width = img.width;
+      editedCanvas.height = img.height;
+      editCtx = editedCanvas.getContext('2d', { willReadFrequently: true });
+      editCtx.drawImage(img, 0, 0);
+      canvas.width = editedCanvas.width;
+      canvas.height = editedCanvas.height;
+      historyStack = [];
+      textList = [];
+      saveSnapshot();
+      zoomActive = false;
+      viewScale = 1;
+      viewOffsetX = 0;
+      viewOffsetY = 0;
+      canvas.classList.remove('active-zoom');
+      render();
+    }
+    img.src = ev.target.result;
+  }
+  reader.readAsDataURL(file);
+}
+
+// 鼠标按下
+canvas.addEventListener('mousedown', e => {
+  e.preventDefault();
+  clearTimeout(longPressTimer);
+  isMouseMoved = false;
+  const pos = getOriginPos(e);
+
+  if (workMode === 'idle') {
+    if (zoomActive) {
+      isViewDrag = true;
+      dragStartClientX = e.clientX - viewOffsetX;
+      dragStartClientY = e.clientY - viewOffsetY;
+    }
+    return;
+  }
+
+  if (workMode === 'draw') {
+    saveSnapshot();
+    isDrawing = true;
+    lastDrawX = pos.x;
+    lastDrawY = pos.y;
+    editCtx.beginPath();
+    editCtx.strokeStyle = `rgb(${selectColor.join(',')})`;
+    editCtx.lineWidth = brushSize;
+    editCtx.lineCap = 'round';
+    editCtx.moveTo(lastDrawX, lastDrawY);
+    return;
+  }
+
+  if (workMode === 'text') {
+    const hitText = findHitText(pos);
+    if (hitText) {
+      longPressTimer = setTimeout(() => {
+        saveSnapshot();
+        draggingText = hitText;
+        dragOffsetX = pos.x - hitText.x;
+        dragOffsetY = pos.y - hitText.y;
+      }, LONG_PRESS_TIME);
+    }
+    return;
+  }
+});
+
+// 鼠标移动
+document.addEventListener('mousemove', e => {
+  if (!editedCanvas) return;
+  isMouseMoved = true;
+  const pos = getOriginPos(e);
+
+  if (workMode === 'idle' && isViewDrag && zoomActive) {
+    viewOffsetX = e.clientX - dragStartClientX;
+    viewOffsetY = e.clientY - dragStartClientY;
+    render();
+    return;
+  }
+
+  if (workMode === 'draw' && isDrawing) {
+    editCtx.lineTo(pos.x, pos.y);
+    editCtx.stroke();
+    lastDrawX = pos.x;
+    lastDrawY = pos.y;
+    render();
+    return;
+  }
+
+  if (workMode === 'text' && draggingText) {
+    draggingText.x = pos.x - dragOffsetX;
+    draggingText.y = pos.y - dragOffsetY;
+    render();
+    return;
+  }
+});
+
+// 鼠标抬起
+document.addEventListener('mouseup', e => {
+  clearTimeout(longPressTimer);
+  if (!editedCanvas) return;
+  const pos = getOriginPos(e);
+
+  if (workMode === 'idle') {
+    isViewDrag = false;
+    return;
+  }
+
+  if (workMode === 'draw') {
+    isDrawing = false;
+    return;
+  }
+
+  if (workMode === 'text') {
+    if (draggingText) {
+      draggingText = null;
+      render();
+    } else if (!isMouseMoved) {
+      saveSnapshot();
+      textList.push({
+        text: numInput.value,
+        x: pos.x,
+        y: pos.y,
+        color: `rgb(${selectColor.join(',')})`
+      });
+      render();
+    }
+    return;
+  }
+});
+
+canvas.addEventListener('mouseleave', () => {
+  clearTimeout(longPressTimer);
+  isViewDrag = false;
+  isDrawing = false;
+  draggingText = null;
+});
+
+// 空闲缩放开关
+canvas.addEventListener('click', e => {
+  if (workMode !== 'idle') return;
+  zoomActive = !zoomActive;
+  canvas.classList.toggle('active-zoom', zoomActive);
+  if (!zoomActive) {
+    viewScale = 1;
+    viewOffsetX = 0;
+    viewOffsetY = 0;
+    render();
+  }
+});
+
+// 吸管取色
+canvas.addEventListener('click', e => {
+  if (workMode !== 'picker' || !editedCanvas) return;
+  const pos = getOriginPos(e);
+  const px = Math.max(0, Math.min(Math.round(pos.x), editedCanvas.width - 1));
+  const py = Math.max(0, Math.min(Math.round(pos.y), editedCanvas.height - 1));
+  const pixel = editCtx.getImageData(px, py, 1, 1).data;
+  selectColor = [pixel[0], pixel[1], pixel[2]];
+  colorView.style.backgroundColor = `rgb(${selectColor.join(',')})`;
+});
+
+// 滚轮缩放
+canvas.addEventListener('wheel', e => {
+  if (workMode !== 'idle' || !zoomActive) return;
+  e.preventDefault();
+  const delta = e.deltaY > 0 ? -0.1 : 0.1;
+  viewScale = Math.max(minScale, Math.min(maxScale, viewScale + delta));
+  render();
+});
+
+document.addEventListener('click', e => {
+  if (!canvas.contains(e.target) && zoomActive && workMode === 'idle') {
+    zoomActive = false;
+    canvas.classList.remove('active-zoom');
+    viewScale = 1;
+    viewOffsetX = 0;
+    viewOffsetY = 0;
+    render();
+  }
+});
+
+// 回车加文字
+document.getElementById('numInput').addEventListener('keydown', e => {
+  if (e.key !== 'Enter' || workMode !== 'text' || !editedCanvas) return;
+  saveSnapshot();
+  textList.push({
+    text: numInput.value,
+    x: 100,
+    y: 100,
+    color: `rgb(${selectColor.join(',')})`
+  });
+  render();
+});
+
+// 【重点修复导出】导出时把文字绘制到底图再下载
+document.getElementById('saveBtn').onclick = () => {
+  if (!editedCanvas) return alert('请先上传图片');
+  // 新建最终导出画布，原图+文字合并
+  const exportCanvas = document.createElement('canvas');
+  exportCanvas.width = editedCanvas.width;
+  exportCanvas.height = editedCanvas.height;
+  const expCtx = exportCanvas.getContext('2d');
+  expCtx.drawImage(editedCanvas, 0, 0);
+  // 将所有文字绘制到导出画布
+  const fontCfg = `${fontWeight} ${fontSize}px system-ui`;
+  expCtx.font = fontCfg;
+  textList.forEach(item => {
+    expCtx.fillStyle = item.color;
+    expCtx.fillText(item.text, item.x, item.y);
+  });
+  const link = document.createElement('a');
+  link.download = '修图成品.png';
+  link.href = exportCanvas.toDataURL('image/png');
+  link.click();
+}
+</script>
+</body>
+</html>
